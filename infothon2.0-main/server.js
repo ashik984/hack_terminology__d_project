@@ -49,12 +49,20 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://majen:majen@majen.f3jgom3.mongodb.net/?appName=majen';
 
 if (MONGO_URI) {
-  mongoose.connect(MONGO_URI)
+  mongoose.connect(MONGO_URI, {
+    serverSelectionTimeoutMS: 30000,
+    socketTimeoutMS: 45000,
+    connectTimeoutMS: 30000,
+    family: 4  // Force IPv4
+  })
     .then(() => {
       console.log('✅ MongoDB connected');
       seedMocks();
     })
-    .catch(err => console.error('❌ MongoDB error:', err.message));
+    .catch(err => {
+      console.error('❌ MongoDB error:', err.message);
+      console.warn('⚠️  Tip: If on venue WiFi, switch to mobile hotspot — venue networks often block MongoDB Atlas (port 27017).');
+    });
 } else {
   console.warn('⚠️  MONGO_URI not set — running without database (demo mode).');
   console.warn('   Create a .env file with: MONGO_URI=mongodb+srv://...');
@@ -207,6 +215,72 @@ async function seedMocks() {
     );
   }
 
+  // ── Seed Demo Accounts (always upsert so they survive restarts) ──
+  console.log('🌱 Seeding demo accounts...');
+
+  // Demo Home User — ashik@ecoroute.app / 12345678
+  const homeHash = await bcrypt.hash('12345678', 10);
+  await User.findOneAndUpdate(
+    { email: 'ashik@ecoroute.app' },
+    {
+      $set: {
+        name: 'Ashik Demo',
+        nickname: 'Ashik',
+        email: 'ashik@ecoroute.app',
+        passwordHash: homeHash,
+        role: 'home',
+        area: 'gokulam_north',
+        address: 'Gokulam 3rd Stage, Mysore',
+        points: 850,
+        fillLevel: 78,
+        location: { lat: 12.3502, lng: 76.6143 }
+      }
+    },
+    { upsert: true, new: true }
+  );
+  console.log('  ✅ Home user: ashik@ecoroute.app / 12345678');
+
+  // Demo Point User — point@ecoroute.app / demo1234
+  const pointHash = await bcrypt.hash('demo1234', 10);
+  await User.findOneAndUpdate(
+    { email: 'point@ecoroute.app' },
+    {
+      $set: {
+        name: 'EcoBin Demo',
+        nickname: 'EcoBin',
+        email: 'point@ecoroute.app',
+        passwordHash: pointHash,
+        role: 'point',
+        area: 'gokulam_north',
+        address: 'Saraswathipuram Main Road, Mysore',
+        points: 2100,
+        fillLevel: 65,
+        location: { lat: 12.3312, lng: 76.6358 }
+      }
+    },
+    { upsert: true, new: true }
+  );
+  console.log('  ✅ Point user: point@ecoroute.app / demo1234');
+
+  // Demo Driver — empId: DEMO01 / pin: 0000
+  const demoDriverHash = await bcrypt.hash('demo0000', 10);
+  await User.findOneAndUpdate(
+    { empId: 'DEMO01' },
+    {
+      $set: {
+        empId: 'DEMO01',
+        pin: '0000',
+        name: 'Ravi Demo Driver',
+        role: 'driver',
+        assignedAreas: ['gokulam_north'],
+        passwordHash: demoDriverHash,
+        isOnline: false,
+        isReserve: false
+      }
+    },
+    { upsert: true, new: true }
+  );
+  console.log('  ✅ Demo driver: empId DEMO01 / pin 0000');
 
   // Seed User Collection History (Real users & Mocks)
   const logCount = await CollectionLog.countDocuments();
@@ -310,15 +384,46 @@ function safeUser(doc) {
 }
 
 // ── DB-not-configured guard ───────────────────────────────────
+function isDbConnected() {
+  return mongoose.connection.readyState === 1;
+}
+
 function requireDb(req, res, next) {
-  if (!MONGO_URI) {
+  if (!MONGO_URI || !isDbConnected()) {
     return res.status(503).json({
-      message: 'Database not configured. Add MONGO_URI to your .env file.',
+      message: 'Database not reachable. Check your network connection (try mobile hotspot).',
       demoMode: true
     });
   }
   next();
 }
+
+// ── In-memory demo users (fallback when DB is unreachable) ────
+const DEMO_USERS = [
+  {
+    _id: 'demo_home_001',
+    name: 'Ashik Demo', nickname: 'Ashik',
+    email: 'ashik@ecoroute.app', password: '12345678',
+    role: 'home', area: 'gokulam_north',
+    address: 'Gokulam 3rd Stage, Mysore',
+    points: 850, fillLevel: 78,
+    location: { lat: 12.3502, lng: 76.6143 }
+  },
+  {
+    _id: 'demo_point_001',
+    name: 'EcoBin Demo', nickname: 'EcoBin',
+    email: 'point@ecoroute.app', password: 'demo1234',
+    role: 'point', area: 'gokulam_north',
+    address: 'Saraswathipuram Main Road, Mysore',
+    points: 2100, fillLevel: 65,
+    location: { lat: 12.3312, lng: 76.6358 }
+  }
+];
+const DEMO_DRIVERS = [
+  { _id: 'demo_driver_001', empId: 'DEMO01', pin: '0000', name: 'Ravi Demo Driver', role: 'driver', assignedAreas: ['gokulam_north'] },
+  { _id: 'demo_driver_d001', empId: 'D001', pin: '1234', name: 'Driver Gokulam North', role: 'driver', assignedAreas: ['gokulam_north'] },
+  { _id: 'demo_driver_d002', empId: 'D002', pin: '1234', name: 'Driver Gokulam South', role: 'driver', assignedAreas: ['gokulam_south'] }
+];
 
 // ════════════════════════════════════════════════════════════
 //  AUTH ROUTES
@@ -359,12 +464,20 @@ app.post('/api/auth/register', requireDb, async (req, res) => {
 });
 
 // POST /api/auth/login  — Home / Point users
-app.post('/api/auth/login', requireDb, async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Email and password are required.' });
 
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required.' });
+    // ── Fallback: use in-memory demo users if DB is down ──
+    if (!isDbConnected()) {
+      const demo = DEMO_USERS.find(u => u.email === email.toLowerCase());
+      if (!demo || demo.password !== password) {
+        return res.status(401).json({ message: 'Invalid credentials. (DB offline — only demo accounts work)' });
+      }
+      const token = signToken(demo._id);
+      const { password: _pw, ...safeDemo } = demo;
+      return res.json({ token, user: safeDemo, _demoMode: true });
     }
 
     const user = await User.findOne({ email: email.toLowerCase(), role: { $in: ['home', 'point'] } });
@@ -382,18 +495,24 @@ app.post('/api/auth/login', requireDb, async (req, res) => {
 });
 
 // POST /api/auth/driver-login  — Driver / Admin
-app.post('/api/auth/driver-login', requireDb, async (req, res) => {
+app.post('/api/auth/driver-login', async (req, res) => {
   try {
     const { empId, pin } = req.body;
+    if (!empId || !pin) return res.status(400).json({ message: 'Employee ID and PIN are required.' });
 
-    if (!empId || !pin) {
-      return res.status(400).json({ message: 'Employee ID and PIN are required.' });
+    // ── Fallback: use in-memory demo drivers if DB is down ──
+    if (!isDbConnected()) {
+      const demo = DEMO_DRIVERS.find(d => d.empId === empId.toUpperCase());
+      if (!demo || demo.pin !== String(pin)) {
+        return res.status(401).json({ message: 'Invalid credentials. (DB offline — only demo drivers work)' });
+      }
+      const token = signToken(demo._id);
+      return res.json({ token, user: demo, _demoMode: true });
     }
 
     const driver = await User.findOne({ empId: empId.toUpperCase(), role: 'driver' });
     if (!driver) return res.status(401).json({ message: 'Employee ID not found.' });
 
-    // PIN check — use bcrypt.compare if you store hashed PINs
     const pinMatch = driver.pin === String(pin);
     if (!pinMatch) return res.status(401).json({ message: 'Incorrect PIN.' });
 
